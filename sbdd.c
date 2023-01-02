@@ -25,6 +25,10 @@
 #define SBDD_MIB_SECTORS       (1 << (20 - SBDD_SECTOR_SHIFT))
 #define SBDD_NAME              "sbdd"
 
+static char *sbdd_backing_dev_path = NULL;
+module_param(sbdd_backing_dev_path, charp, 0);
+MODULE_PARM_DESC(sbdd_backing_dev_path, "Backing device path\n");
+
 struct sbdd {
 	wait_queue_head_t       exitwait;
 	spinlock_t              datalock;
@@ -34,6 +38,7 @@ struct sbdd {
 	u8                      *data;
 	struct gendisk          *gd;
 	struct request_queue    *q;
+	struct block_device 	*backing_dev;
 };
 
 static struct sbdd      __sbdd;
@@ -97,6 +102,47 @@ static blk_qc_t sbdd_make_request(struct request_queue *q, struct bio *bio)
 	return BLK_STS_OK;
 }
 
+static void sbdd_bi_end_io(struct bio *bio)
+{
+	bio_endio(bio->bi_private);
+}
+
+static blk_qc_t sbdd_backing_dev_make_request(struct request_queue *q, struct bio *bio)
+{
+	struct bio *clone_bio = NULL;
+
+	if (atomic_read(&__sbdd.deleting)) {
+		pr_err("unable to process bio while deleting\n");
+		bio_io_error(bio);
+		return BLK_STS_IOERR;
+	}
+
+	atomic_inc(&__sbdd.refs_cnt);
+
+	clone_bio = bio_clone_fast(bio, GFP_KERNEL, NULL);
+	if (!clone_bio) {
+		pr_err("call bio_clone_fast() failed with %d\n", __sbdd_major);
+		bio_io_error(bio);
+
+		if (atomic_dec_and_test(&__sbdd.refs_cnt))
+			wake_up(&__sbdd.exitwait);
+
+		return BLK_STS_IOERR;
+	}
+
+	bio_set_dev(clone_bio, __sbdd.backing_dev);
+
+	clone_bio->bi_private = bio;
+	clone_bio->bi_end_io = sbdd_bi_end_io;
+
+	submit_bio(clone_bio);
+
+	if (atomic_dec_and_test(&__sbdd.refs_cnt))
+		wake_up(&__sbdd.exitwait);
+
+	return BLK_STS_OK;
+}
+
 /*
 There are no read or write operations. These operations are performed by
 the request() function associated with the request queue of the disk.
@@ -124,6 +170,16 @@ static int sbdd_create(void)
 	__sbdd.capacity = (sector_t)__sbdd_capacity_mib * SBDD_MIB_SECTORS;
 
 	pr_info("allocating data\n");
+
+	if (sbdd_backing_dev_path) {
+		__sbdd.backing_dev = blkdev_get_by_path(sbdd_backing_dev_path,
+			FMODE_READ | FMODE_WRITE, THIS_MODULE);
+		if (IS_ERR(__sbdd.backing_dev)) {
+			__sbdd.backing_dev = NULL;
+			pr_err("call blkdev_get_by_path() failed with %d\n", __sbdd_major);
+			return -EBUSY;
+		}
+	}
 	__sbdd.data = vzalloc(__sbdd.capacity << SBDD_SECTOR_SHIFT);
 	if (!__sbdd.data) {
 		pr_err("unable to alloc data\n");
@@ -139,7 +195,8 @@ static int sbdd_create(void)
 		pr_err("call blk_alloc_queue() failed\n");
 		return -EINVAL;
 	}
-	blk_queue_make_request(__sbdd.q, sbdd_make_request);
+	blk_queue_make_request(__sbdd.q, __sbdd.backing_dev ?
+		sbdd_backing_dev_make_request : sbdd_make_request);
 
 	/* Configure queue */
 	blk_queue_logical_block_size(__sbdd.q, SBDD_SECTOR_SIZE);
@@ -199,6 +256,10 @@ static void sbdd_delete(void)
 		pr_info("unregistering blkdev\n");
 		unregister_blkdev(__sbdd_major, SBDD_NAME);
 		__sbdd_major = 0;
+	}
+
+	if (__sbdd.backing_dev) {
+		blkdev_put(__sbdd.backing_dev, FMODE_READ | FMODE_WRITE);
 	}
 }
 
